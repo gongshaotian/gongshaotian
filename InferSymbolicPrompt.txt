@@ -1,0 +1,344 @@
+请根据以下规则,将给定的 C++ InferMeta 函数转换为InferSymbolicShape符号形状推断函数:
+1. 函数名称: 将原函数名称 "XXXInferMeta" 转换为 "XXXOpInferSymbolicShape" 的形式。
+2. 函数参数:
+  * 添加两个参数: pir::Operation *op 和 pir::InferSymbolicShapeContext *infer_context。
+  * 使用 infer_context->GetShapeOrDataForValue(op->operand_source(index)) 获取输入张量的符号形状或数据。
+3. 维度信息:
+  * 将输入张量的维度信息转换为 std::vector\<symbol::DimExpr\> 类型的符号表达式。
+  * 使用 PADDLE_ENFORCE_EQ 宏检查输入张量的rank是否满足特定条件(InferMeta函数中的phi namespace需要替换为common namespace)。
+  * 使用 infer_context->AddEqualCstr(dim1, dim2) 添加具体维度相等的约束条件（注意： 相等约束只作用在具体的维度值上，rank仍需要使用PADDLE_ENFORCE宏检查）。
+4. 属性获取:
+  * 普通类型的属性获取接口（以int32类型为例，bool, int64, float类型同理）：op->attribute\<pir::Int32Attribute\>("attr_name").data();
+  * string类型属性获取接口： op->attribute\<pir::StrAttribute\>("attr_name").AsString()
+  * vector<int>类型属性获取接口：paddle::dialect::details::GetVectorAttr\<int\>(op, "attr_name")
+  * vector<int64_t>类型属性获取接口：paddle::dialect::details::GetVectorAttr\<int64_t\>(op, "attr_name")
+  * Scalar和IntArray类型参数当做输入Tensor处理
+5. 输出张量形状:
+  * 创建一个 std::vector\<symbol::DimExpr\>类型的变量表示输出张量的形状。
+  * 根据输入张量的符号形状和属性值,构建输出张量的符号形状。
+  * 对于常量维度,直接使用 symbol::DimExpr(value) 创建符号表达式。
+  * symbol::DimExpr的计算可以直接使用+-*/符号
+6. 设置输出张量:
+  * 使用 infer_context->SetShapeOrDataForValue(op->result(index), symbol::ShapeOrDataDimExprs{symbol::TensorShapeOrDataDimExprs(output_shape)}) 设置输出张量的符号形状。
+7. 返回值:
+  * 函数返回 true 表示符号形状推断成功。
+
+举例：你可以先学习下面几组函数代码转换示例，每组算子的InferMeta和InferSymbolicShape函数之间有固定的转换关系，学习之后我将会给你提供一个新的InferMeta函数，你需要为他生成对应的InferSymbolicShape函数代码。
+第一组:
+```
+void MatmulInferMeta(const MetaTensor& x,
+                     const MetaTensor& y,
+                     bool trans_x,
+                     bool trans_y,
+                     MetaTensor* out) {
+  std::vector<int64_t> dims_x = common::vectorize(x.dims());
+  std::vector<int64_t> dims_y = common::vectorize(y.dims());
+  auto ndims_x = dims_x.size();
+  auto ndims_y = dims_y.size();
+  PADDLE_ENFORCE_GT(ndims_x,
+                    0UL,
+                    phi::errors::InvalidArgument(
+                        "The Input(x) dims size must be greater than 0,"
+                        " but received dims size is 0. "));
+  PADDLE_ENFORCE_GT(ndims_y,
+                    0UL,
+                    phi::errors::InvalidArgument(
+                        "The Input(y) dims size must be greater than 0,"
+                        " but received dims size is 0. "));
+
+  bool x_broadcasted = false, y_broadcasted = false;
+  if (ndims_x == 1) {
+    dims_x.insert(dims_x.begin(), 1);
+    ndims_x = 2;
+    x_broadcasted = true;
+  }
+
+  if (ndims_y == 1) {
+    dims_y.push_back(1);
+    ndims_y = 2;
+    y_broadcasted = true;
+  }
+
+  size_t M = 0, N = 0;
+  if (trans_x) {
+    M = dims_x[ndims_x - 1];
+  } else {
+    M = dims_x[ndims_x - 2];
+  }
+  if (trans_y) {
+    N = dims_y[ndims_y - 2];
+  } else {
+    N = dims_y[ndims_y - 1];
+  }
+
+  std::vector<int64_t> new_dims;
+  if (ndims_x > ndims_y) {
+    new_dims.assign(dims_x.begin(), dims_x.end() - 2);
+  } else if (ndims_x < ndims_y) {
+    new_dims.assign(dims_y.begin(), dims_y.end() - 2);
+  } else {
+    new_dims.reserve(ndims_x);
+    for (size_t i = 0; i < ndims_x - 2; ++i) {
+      new_dims.push_back(std::max(dims_x[i], dims_y[i]));
+    }
+  }
+  if (!x_broadcasted) {
+    new_dims.push_back(M);  // NOLINT
+  }
+  if (!y_broadcasted) {
+    new_dims.push_back(N);  // NOLINT
+  }
+
+  auto ddim_out = common::make_ddim(new_dims);
+
+  out->set_dims(ddim_out);
+  if (x.dtype() == phi::DataType::INT8) {
+    out->set_dtype(phi::DataType::INT32);
+  } else {
+    out->set_dtype(x.dtype());
+  }
+  out->set_layout(x.layout());
+}
+```
+```
+bool MatmulOpInferSymbolicShape(pir::Operation *op,
+                                pir::InferSymbolicShapeContext *infer_context) {
+  // x_dims can't be const or ref here, in case to be broadcasted
+  std::vector<symbol::DimExpr> x_dims = [&] {
+    std::vector<symbol::DimExpr> dims;
+    const auto &x_shape_or_data =
+        infer_context->GetShapeOrDataForValue(op->operand_source(0));
+    dims = x_shape_or_data.shape();
+    return dims;
+  }();
+
+  // y_dims can't be const or ref here, in case to be broadcasted
+  std::vector<symbol::DimExpr> y_dims = [&] {
+    std::vector<symbol::DimExpr> dims;
+    const auto y_shape_or_data =
+        infer_context->GetShapeOrDataForValue(op->operand_source(1));
+    dims = y_shape_or_data.shape();
+    return dims;
+  }();
+
+  size_t ndims_x = x_dims.size();
+  size_t ndims_y = y_dims.size();
+
+  const bool x_broadcasted = [&] {
+    bool broadcasted = false;
+    if (ndims_x == 1) {
+      x_dims.insert(x_dims.begin(), 1);
+      ndims_x = 2;
+      broadcasted = true;
+    }
+    return broadcasted;
+  }();
+
+  const bool y_broadcasted = [&] {
+    bool broadcasted = false;
+    if (ndims_y == 1) {
+      y_dims.emplace_back(1);
+      ndims_y = 2;
+      broadcasted = true;
+    }
+    return broadcasted;
+  }();
+
+  std::vector<symbol::DimExpr> out_dims;
+  if (ndims_x > ndims_y) {
+    out_dims.assign(x_dims.begin(), x_dims.end() - 2);
+  } else if (ndims_x < ndims_y) {
+    out_dims.assign(y_dims.begin(), y_dims.end() - 2);
+  } else {
+    symbol::DimExprBuilder builder;
+    for (size_t i = 0; i < ndims_x - 2; ++i) {
+      out_dims.emplace_back(builder.Broadcast(x_dims[i], y_dims[i]));
+      infer_context->AddBroadcastableCstr(x_dims[i], y_dims[i]);
+    }
+  }
+
+  bool transpose_x_attr = GetBoolAttr(op, "transpose_x");
+  bool transpose_y_attr = GetBoolAttr(op, "transpose_y");
+  symbol::DimExpr out_M =
+      transpose_x_attr ? x_dims[ndims_x - 1] : x_dims[ndims_x - 2];
+  symbol::DimExpr out_N =
+      transpose_y_attr ? y_dims[ndims_y - 2] : y_dims[ndims_y - 1];
+  if (!x_broadcasted) {
+    out_dims.emplace_back(out_M);
+  }
+  if (!y_broadcasted) {
+    out_dims.emplace_back(out_N);
+  }
+
+  infer_context->SetShapeOrDataForValue(op->result(0),
+                                         symbol::ShapeOrDataDimExprs{symbol::TensorShapeOrDataDimExprs(out_dims)});
+
+  if ((ndims_x == ndims_y) && ndims_x >= 2) {
+    if (transpose_x_attr == false && transpose_y_attr == false) {
+      infer_context->AddEqualCstr(x_dims[ndims_x - 1], y_dims[ndims_x - 2]);
+    } else if (transpose_x_attr == false && transpose_y_attr == true) {
+      infer_context->AddEqualCstr(x_dims[ndims_x - 1], y_dims[ndims_x - 1]);
+    } else if (transpose_x_attr == true && transpose_y_attr == false) {
+      infer_context->AddEqualCstr(x_dims[ndims_x - 2], y_dims[ndims_x - 2]);
+    } else {
+      infer_context->AddEqualCstr(x_dims[ndims_x - 2], y_dims[ndims_x - 1]);
+    }
+
+    for (size_t i = 0; i < ndims_x - 2; ++i) {
+      infer_context->AddEqualCstr(x_dims[i], y_dims[i]);
+    }
+  }
+  return true;
+}
+```
+
+第二组：
+```
+void GroupNormInferMeta(const MetaTensor& x,
+                        const MetaTensor& scale,
+                        const MetaTensor& bias,
+                        float epsilon,
+                        int groups,
+                        const std::string& data_layout_str,
+                        MetaTensor* y,
+                        MetaTensor* mean,
+                        MetaTensor* variance) {
+  PADDLE_ENFORCE_NE(y,
+                    nullptr,
+                    phi::errors::InvalidArgument(
+                        "The y in GroupNormInferMeta can't be nullptr."));
+  PADDLE_ENFORCE_NE(mean,
+                    nullptr,
+                    phi::errors::InvalidArgument(
+                        "The mean in GroupNormInferMeta can't be nullptr."));
+  PADDLE_ENFORCE_NE(
+      variance,
+      nullptr,
+      phi::errors::InvalidArgument(
+          "The variance in GroupNormInferMeta can't be nullptr."));
+
+  auto x_dim = x.dims();
+  PADDLE_ENFORCE_GE(
+      x_dim.size(),
+      2,
+      phi::errors::InvalidArgument(
+          "The Input(X)'s dimension of Op(group_norm) must be "
+          "greater than 1. But received: %u-D Tensor, which shape is [%s].",
+          x_dim.size(),
+          x_dim));
+
+  const DataLayout data_layout = common::StringToDataLayout(data_layout_str);
+  const int64_t channel_num =
+      (data_layout == DataLayout::kNCHW ? x_dim[1] : x_dim[x_dim.size() - 1]);
+  auto batch_size = x_dim[0];
+  PADDLE_ENFORCE_LE(
+      groups,
+      channel_num,
+      phi::errors::InvalidArgument(
+          "The Attr(groups) of Op(group_norm) must be less than or "
+          "equal to the number of channels. But received: groups "
+          "is [%s], channels is [%s], the Attr(data_layout) "
+          "is [%s]. The error may come from wrong data_layout setting.",
+          groups,
+          channel_num,
+          data_layout_str));
+  PADDLE_ENFORCE_GE(
+      groups,
+      1,
+      phi::errors::InvalidArgument(
+          "The Attr(groups) of Op(group_norm) must be "
+          "greater than or equal to 1. But received: groups is [%s].",
+          groups));
+  PADDLE_ENFORCE_EQ(
+      channel_num % groups,
+      0,
+      phi::errors::InvalidArgument(
+          "Expected number of channels in input to be divisible by "
+          "num_groups, but got input channel is %d and num_groups is %d",
+          channel_num,
+          groups));
+
+  if (scale) {
+    PADDLE_ENFORCE_EQ(
+        scale.dims().size(),
+        1UL,
+        phi::errors::InvalidArgument(
+            "The Input(Scale) of Op(group_norm) should be 1-D Tensor. "
+            "But received: %u-D Tensor, the shape of Input(Scale) is [%s].",
+            scale.dims().size(),
+            scale.dims()));
+    PADDLE_ENFORCE_EQ(
+        scale.dims()[0],
+        channel_num,
+        phi::errors::InvalidArgument(
+            "The Input(Scale)'s first dimension size of Op(group_norm) must "
+            "be equal to the number of channels. But received: the "
+            "Input(Scale)'s first dimension size is [%s], the channels is "
+            "[%s], the Attr(data_layout) is [%s]. The error may come "
+            "from wrong data_layout setting.",
+            scale.dims()[0],
+            channel_num,
+            data_layout_str));
+  }
+  if (bias) {
+    PADDLE_ENFORCE_EQ(
+        bias.dims().size(),
+        1UL,
+        phi::errors::InvalidArgument(
+            "The Input(Bias) of Op(group_norm) should be 1-D Tensor. "
+            "But received: %u-D Tensor, the shape of Input(Bias) is [%s].",
+            bias.dims().size(),
+            bias.dims()));
+    PADDLE_ENFORCE_EQ(
+        bias.dims()[0],
+        channel_num,
+        phi::errors::InvalidArgument(
+            "The Input(Bias)'s first dimension size of "
+            "Op(group_norm) must be equal to the number of channels. "
+            "But received: the Input(Bias)'s first dimension size is [%s], "
+            "the channels is [%s], the Attr(data_layout) is [%s]. The "
+            "error may come from wrong data_layout setting.",
+            bias.dims()[0],
+            channel_num,
+            data_layout_str));
+  }
+  y->set_dims(x_dim);
+  y->set_dtype(x.dtype());
+  y->share_lod(x);
+
+  phi::DataType x_dtype = x.dtype();
+  phi::DataType param_type =
+      (x_dtype == phi::DataType::BFLOAT16 || x_dtype == phi::DataType::FLOAT16)
+          ? phi::DataType::FLOAT32
+          : x_dtype;
+  if (mean) {
+    mean->set_dims({batch_size, groups});
+    mean->set_dtype(param_type);
+  }
+  if (variance) {
+    variance->set_dims({batch_size, groups});
+    variance->set_dtype(param_type);
+  }
+}
+```
+```
+bool GroupNormOpInferSymbolicShape(
+    pir::Operation *op, pir::InferSymbolicShapeContext *infer_context) {
+  const symbol::ShapeOrDataDimExprs &x_shape =
+      infer_context->GetShapeOrDataForValue(op->operand_source(0));
+
+  infer_context->SetShapeOrDataForValue(op->result(0), x_shape);
+
+  const symbol::DimExpr &batch_size = x_shape.shape()[0];
+  int groups = op->attribute<pir::Int32Attribute>("groups").data();
+  symbol::TensorShapeOrDataDimExprs mean_shape(
+      std::vector<symbol::DimExpr>{batch_size, groups});
+  if (op->result(1)) {
+    infer_context->SetShapeOrDataForValue(op->result(1), mean_shape);
+  }
+  if (op->result(2)) {
+    infer_context->SetShapeOrDataForValue(op->result(2), mean_shape);
+  }
+  return true;
+}
+```
