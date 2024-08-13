@@ -12,7 +12,7 @@
   * string类型属性获取接口： op->attribute\<pir::StrAttribute\>("attr_name").AsString()
   * vector<int>类型属性获取接口：paddle::dialect::details::GetVectorAttr\<int\>(op, "attr_name")
   * vector<int64_t>类型属性获取接口：paddle::dialect::details::GetVectorAttr\<int64_t\>(op, "attr_name")
-  * Scalar和IntArray类型参数当做输入Tensor处理
+  * Scalar和IntArray类型参数需要根据pd_op.h和yaml文件中的定义综合考虑，可能会出现能从 attribute 或oprand value 中获取的情况
 5. 输出张量形状:
   * 创建一个 std::vector\<symbol::DimExpr\>类型的变量表示输出张量的形状。
   * 根据输入张量的符号形状和属性值,构建输出张量的符号形状。
